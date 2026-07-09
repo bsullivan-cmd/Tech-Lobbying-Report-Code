@@ -1,293 +1,378 @@
 // ============================================================
-//  LDA Lobbyist Data Fetcher — Q2 2025 (v2)
-//  Updated with exact client names + new lda.gov API
+//  LDA Lobbyist Data Fetcher — Q2 2026 (v3)
+//  - Fixed corrupted API key quotes (was curly quotes, syntax error)
+//  - Fixed FILING_YEAR typo (was "2065")
+//  - Added ByteDance, Snap Inc., X Corp/Twitter, TechNet, NetChoice
+//  - Replaced the "metal" blacklist hack with a real name-match
+//    validator (fixes Meta/Metal, and would've hit X/Snap too)
+//  - Added incremental refresh so this can run on a 5-min trigger
+//    without re-fetching or duplicating rows already collected
 //
 //  SETUP:
 //  1. Register for a free API key at lda.gov/api/register/
 //  2. In Google Sheets: Extensions > Apps Script > paste this
 //  3. Replace YOUR_API_KEY_HERE with your key
-//  4. Run onOpen() once, reload sheet, then use the menu
+//  4. Run onOpen() once, reload sheet, then use the menu:
+//       "LDA Tools > Full Rebuild"        -> wipes + refetches everything
+//       "LDA Tools > Check For New Now"   -> one incremental pull
+//       "LDA Tools > Enable Auto-Refresh" -> installs 5-min trigger
+//       "LDA Tools > Disable Auto-Refresh"
 // ============================================================
-
-const API_KEY = “855d7c794f4658d6bb273ba236079d4a2aa9c4c1";
+const API_KEY = "855d7c794f4658d6bb273ba236079d4a2aa9c4c1";
 const BASE_URL = "https://lda.gov/api/v1";
-const FILING_YEAR = "2025";
-const FILING_PERIOD = "second_quarter"; // Q2 = April through June
-
+const FILING_YEAR = "2026";              // 
+const FILING_PERIOD = "second_quarter";  // Q2 = April through June
+const SHEET_NAME = "LDA Q2 2026";
+const TRACKING_SHEET_NAME = "_SeenFilings";
 // Each entry is { label, names[] }
-// Multiple name variations are searched and deduplicated
+// Multiple name variations are searched and deduplicated.
+// NOTE: avoid single-word / very short names (like bare "X") — the
+// LDA API matches substrings, so short names cause huge amounts of
+// noise. isGenuineMatch() below also guards against this, but it's
+// still wasteful to search for them.
 const TARGET_COMPANIES = [
-  {
-    label: "ANTHROPIC",
-    names: ["Anthropic", "Anthropic PBC", "Anthropic, PBC", "Anthropic LLC"]
-  },
-  {
-    label: "GOOGLE",
-    names: ["Google", "Google LLC", "Google Inc", "Google Inc.", "Alphabet", "Alphabet Inc", "Alphabet Inc.", "Google Ireland", "Google International"]
-  },
-  {
-    label: "LINKEDIN",
-    names: ["LinkedIn", "LinkedIn Corporation", "LinkedIn Corp"]
-  },
-  {
-    label: "META",
-    names: ["Meta", "Meta Platforms", "Meta Platforms, Inc.", "Meta Platforms Inc", "Facebook", "Facebook, Inc.", "Facebook Inc"]
-  },
-  {
-    label: "MICROSOFT",
-    names: ["Microsoft", "Microsoft Corporation", "Microsoft Corp", "Microsoft Corp.", "Microsoft Online", "Microsoft Ireland"]
-  },
-  {
-    label: "NVIDIA",
-    names: ["NVIDIA", "Nvidia", "NVIDIA Corporation", "Nvidia Corporation"]
-  },
-  {
-    label: "OPENAI",
-    names: ["OpenAI", "OpenAI LLC", "OpenAI, LLC", "Open AI"]
-  },
-  {
-    label: "VERILY LIFE SCIENCES",
-    names: ["Verily", "Verily Life Sciences", "Verily Life Sciences LLC"]
-  },
-  {
-    label: "WAYMO",
-    names: ["Waymo", "Waymo LLC"]
-  },
-  {
-    label: "WING AVIATION",
-    names: ["Wing Aviation", "Wing Aviation LLC", "Wing LLC"]
-  }
+{
+  label: "ANTHROPIC",
+  names: ["Anthropic", "Anthropic PBC", "Anthropic, PBC", "Anthropic LLC"]
+},
+{
+  label: "GOOGLE",
+  names: ["Google", "Google LLC", "Google Inc", "Google Inc.", "Alphabet", "Alphabet Inc", "Alphabet Inc.", "Google Ireland", "Google International"]
+},
+{
+  label: "LINKEDIN",
+  names: ["LinkedIn", "LinkedIn Corporation", "LinkedIn Corp"]
+},
+{
+  label: "META",
+  names: ["Meta", "Meta Platforms", "Meta Platforms, Inc.", "Meta Platforms Inc", "Facebook", "Facebook, Inc.", "Facebook Inc"]
+},
+{
+  label: "MICROSOFT",
+  names: ["Microsoft", "Microsoft Corporation", "Microsoft Corp", "Microsoft Corp.", "Microsoft Online", "Microsoft Ireland"]
+},
+{
+  label: "NVIDIA",
+  names: ["NVIDIA", "Nvidia", "NVIDIA Corporation", "Nvidia Corporation"]
+},
+{
+  label: "OPENAI",
+  names: ["OpenAI", "OpenAI LLC", "OpenAI, LLC", "Open AI"]
+},
+{
+  label: "VERILY LIFE SCIENCES",
+  names: ["Verily", "Verily Life Sciences", "Verily Life Sciences LLC"]
+},
+{
+  label: "WAYMO",
+  names: ["Waymo", "Waymo LLC"]
+},
+{
+  label: "WING AVIATION",
+  names: ["Wing Aviation", "Wing Aviation LLC", "Wing LLC"]
+},
+{
+  label: "BYTEDANCE",
+  names: ["ByteDance", "ByteDance Ltd", "ByteDance Ltd.", "ByteDance Inc", "ByteDance Inc.", "TikTok", "TikTok Inc", "TikTok Inc.", "TikTok LLC"]
+},
+{
+  label: "SNAP INC",
+  names: ["Snap Inc.", "Snap Inc", "Snap"]
+},
+{
+  label: "X CORP (TWITTER)",
+  // Deliberately NOT searching bare "X" — see note above.
+  names: ["X Corp", "X Corp.", "X Corp LLC", "X Holdings", "Twitter", "Twitter, Inc.", "Twitter Inc"]
+},
+{
+  label: "TECHNET",
+  names: ["TechNet"]
+},
+{
+  label: "NETCHOICE",
+  names: ["NetChoice"]
+}
 ];
-
-
 // ============================================================
-//  MAIN ENTRY POINT
+//  NAME NORMALIZATION / MATCH VALIDATION
+//  Replaces the old "contains 'metal'" hack. Requires a genuine
+//  whole-word match instead of a loose substring match, which is
+//  what let Metal (vs Meta) through — and would've let almost
+//  anything through for a name as short as "X" or "Snap".
 // ============================================================
+function normalizeName(s) {
+return (s || "")
+  .toLowerCase()
+  .replace(/[.,]/g, "")
+  .replace(/\b(inc|llc|corp|corporation|ltd|pbc|co|holdings)\b/g, "")
+  .replace(/\s+/g, " ")
+  .trim();
+}
+function isGenuineMatch(targetName, candidateName) {
+const a = normalizeName(targetName);
+const b = normalizeName(candidateName);
+if (!a || !b) return false;
+if (a === b) return true;
+const escaped = a.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const re = new RegExp(`^${escaped}(\\s|$)`);
+return re.test(b);
+}
+// True if candidateName genuinely matches ANY of this company's
+// known name variations (used to validate API results and to
+// detect in-house lobbying, replacing the old fragile keyword logic).
+function matchesCompany(company, candidateName) {
+return company.names.some(n => isGenuineMatch(n, candidateName));
+}
+// ============================================================
+//  TRACKING SHEET (persists which filings we've already pulled in,
+//  so a 5-min trigger can append only new data, not re-fetch)
+// ============================================================
+function getTrackingSheet() {
+const ss = SpreadsheetApp.getActiveSpreadsheet();
+let sheet = ss.getSheetByName(TRACKING_SHEET_NAME);
+if (!sheet) {
+  sheet = ss.insertSheet(TRACKING_SHEET_NAME);
+  sheet.getRange(1, 1, 1, 2).setValues([["filing_uuid", "date_added"]]);
+  sheet.hideSheet();
+}
+return sheet;
+}
+function loadSeenFilingIds() {
+const sheet = getTrackingSheet();
+const lastRow = sheet.getLastRow();
+if (lastRow < 2) return new Set();
+const ids = sheet.getRange(2, 1, lastRow - 1, 1).getValues().flat();
+return new Set(ids);
+}
+function markFilingsSeen(uuids) {
+if (!uuids || uuids.length === 0) return;
+const sheet = getTrackingSheet();
+const now = new Date();
+const rows = uuids.map(id => [id, now]);
+sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 2).setValues(rows);
+}
+function resetTracking() {
+const sheet = getTrackingSheet();
+sheet.clearContents();
+sheet.getRange(1, 1, 1, 2).setValues([["filing_uuid", "date_added"]]);
+}
+// ============================================================
+//  MAIN ENTRY POINTS
+// ============================================================
+// Full rebuild: wipes everything and refetches from scratch.
 function runAll() {
-  setupSheet();
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("LDA Q2 2025");
-  let rowIndex = 2;
-
-  for (const company of TARGET_COMPANIES) {
-    Logger.log(`\n===== Processing: ${company.label} =====`);
-    const rows = fetchAllVariations(company);
-
-    if (rows.length === 0) {
-      sheet.getRange(rowIndex, 1, 1, 8).setValues([[
-        company.label, "—", "No filings found for Q2 2025", "—", "—", "—", "—", "—"
+setupSheet(true);
+resetTracking();
+const added = processCompanies({ incremental: false });
+SpreadsheetApp.getUi().alert(
+  `✅ Full rebuild complete!\n\n${added} filing row(s) loaded.\n\nGreen = In-House | Yellow = Outside Firm | Red = No filings found`
+);
+}
+// Incremental refresh: appends only filings not already collected.
+// Safe to run on a timer (e.g. every 5 minutes) — will not duplicate rows.
+function refreshNewFilings() {
+setupSheet(false);
+const added = processCompanies({ incremental: true });
+Logger.log(`Incremental refresh complete. ${added} new row(s) added.`);
+}
+// ============================================================
+//  SHARED PROCESSING LOOP
+// ============================================================
+function processCompanies(opts) {
+const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+const seen = loadSeenFilingIds();
+const newlySeenIds = [];
+let rowIndex = Math.max(sheet.getLastRow() + 1, 2);
+let addedCount = 0;
+TARGET_COMPANIES.forEach((company, companyIdx) => {
+  Logger.log(`\n===== Processing: ${company.label} =====`);
+  const filings = fetchGenuineFilings(company);
+  // Skip filings we've already recorded in a previous run
+  const freshFilings = filings.filter(f => !seen.has(f.filing_uuid));
+  if (freshFilings.length === 0) {
+    if (!opts.incremental) {
+      sheet.getRange(rowIndex, 1, 1, 9).setValues([[
+        company.label, "—", "No filings found for this period", "—", "—", "—", "—", "—", new Date()
       ]]);
-
-      // Light red background for no-result rows
-      sheet.getRange(rowIndex, 1, 1, 8).setBackground("#fde8e8");
+      sheet.getRange(rowIndex, 1, 1, 9).setBackground("#fde8e8");
       rowIndex++;
-    } else {
-      // Color-code alternating companies for readability
-      const bgColor = TARGET_COMPANIES.indexOf(company) % 2 === 0 ? "#f0f4ff" : "#ffffff";
-
+    }
+  } else {
+    const bgColor = companyIdx % 2 === 0 ? "#f0f4ff" : "#ffffff";
+    freshFilings.forEach(filing => {
+      const rows = buildRows(company, filing);
       rows.forEach(row => {
-        sheet.getRange(rowIndex, 1, 1, 8).setValues([row]);
-        sheet.getRange(rowIndex, 1, 1, 8).setBackground(bgColor);
-
-        // Highlight IN-HOUSE rows in green
+        sheet.getRange(rowIndex, 1, 1, 9).setValues([row]);
+        sheet.getRange(rowIndex, 1, 1, 9).setBackground(bgColor);
         if (row[3] === "IN-HOUSE") {
           sheet.getRange(rowIndex, 4, 1, 1).setBackground("#d4edda").setFontColor("#155724");
         } else if (row[3] === "OUTSIDE FIRM") {
           sheet.getRange(rowIndex, 4, 1, 1).setBackground("#fff3cd").setFontColor("#856404");
         }
-
         rowIndex++;
+        addedCount++;
       });
-    }
-
-    // Blank separator row between companies
-    rowIndex++;
-    Utilities.sleep(300);
+      newlySeenIds.push(filing.filing_uuid);
+    });
   }
-
-  // Auto-resize all columns
-  for (let i = 1; i <= 8; i++) {
-    sheet.autoResizeColumn(i);
-  }
-
-  Logger.log("All done!");
-  SpreadsheetApp.getUi().alert("✅ LDA Q2 2025 data loaded!\n\nGreen = In-House | Yellow = Outside Firm | Red = No filings found");
+  if (!opts.incremental) rowIndex++; // blank separator row, full rebuild only
+  Utilities.sleep(200);
+});
+markFilingsSeen(newlySeenIds);
+for (let i = 1; i <= 9; i++) {
+  sheet.autoResizeColumn(i);
 }
-
-
-// ============================================================
-//  FETCH ACROSS ALL NAME VARIATIONS FOR ONE COMPANY
-// ============================================================
-function fetchAllVariations(company) {
-  const allRows = [];
-  const seenFilings = new Set();
-
-  for (const name of company.names) {
-    // Search as client (company hired a lobbying firm)
-    const clientFilings = searchFilings(name, "client");
-    // Search as registrant (company has in-house lobbyists)
-    const registrantFilings = searchFilings(name, "registrant");
-    const combined = [...clientFilings, ...registrantFilings];
-
-    for (const filing of combined) {
-      if (seenFilings.has(filing.filing_uuid)) continue;
-      seenFilings.add(filing.filing_uuid);
-
-      const rows = buildRows(company.label, filing);
-      allRows.push(...rows);
-    }
-
-    Utilities.sleep(200);
-  }
-
-  return allRows;
+return addedCount;
 }
-
-
+// ============================================================
+//  FETCH + VALIDATE ACROSS ALL NAME VARIATIONS FOR ONE COMPANY
+// ============================================================
+function fetchGenuineFilings(company) {
+const allRows = [];
+const seenInThisFetch = new Set();
+company.names.forEach(name => {
+  const clientFilings = searchFilings(name, "client");
+  const registrantFilings = searchFilings(name, "registrant");
+  // Validate: the field we searched must genuinely match one of
+  // this company's known names, not just contain the search text.
+  const validClient = clientFilings.filter(f => matchesCompany(company, f.client?.name || ""));
+  const validRegistrant = registrantFilings.filter(f => matchesCompany(company, f.registrant?.name || ""));
+  [...validClient, ...validRegistrant].forEach(filing => {
+    if (seenInThisFetch.has(filing.filing_uuid)) return;
+    seenInThisFetch.add(filing.filing_uuid);
+    allRows.push(filing);
+  });
+  Utilities.sleep(200);
+});
+return allRows;
+}
 // ============================================================
 //  SEARCH FILINGS BY CLIENT OR REGISTRANT NAME
 // ============================================================
 function searchFilings(name, role) {
-  const allResults = [];
-  const paramKey = role === "client" ? "client_name" : "registrant_name";
-  let page = 1;
-  let hasMore = true;
-
-  while (hasMore) {
-    const url = `${BASE_URL}/filings/?${paramKey}=${encodeURIComponent(name)}&filing_year=${FILING_YEAR}&filing_period=${FILING_PERIOD}&page=${page}&page_size=25&format=json`;
-
-    try {
-      const response = UrlFetchApp.fetch(url, {
-        headers: { "Authorization": "Token " + API_KEY },
-        muteHttpExceptions: true
-      });
-
-      const code = response.getResponseCode();
-      if (code === 401) {
-        throw new Error("Invalid API key — check your key at lda.gov");
-      }
-      if (code !== 200) {
-        Logger.log(`HTTP ${code} for "${name}" (${role}), page ${page}`);
-        break;
-      }
-
-      const data = JSON.parse(response.getContentText());
-      if (data.results && data.results.length > 0) {
-        const filtered = data.results.filter(filing => {
-          const filingType = (filing.filing_type_display || "").toLowerCase();
-          const registrant = (filing.registrant?.name || "").toLowerCase();
-          const isAmendmentOrReg = filingType.includes("amendment") || filingType.includes("registration");
-          const hasMetal = registrant.includes("metal");
-          return !isAmendmentOrReg && !hasMetal;
-        });
-        allResults.push(...filtered);
-        Logger.log(`  Found ${filtered.length} filing(s) for "${name}" as ${role} (after filters)`);
-      }
-
-      hasMore = !!data.next;
-      page++;
-      Utilities.sleep(150);
-
-    } catch (e) {
-      Logger.log(`Error for "${name}" (${role}): ${e}`);
-      break;
-    }
-  }
-
-  return allResults;
-}
-
-
-// ============================================================
-//  BUILD SHEET ROWS FROM A FILING
-// ============================================================
-function buildRows(companyLabel, filing) {
-  const rows = [];
-  const clientName   = filing.client?.name || "—";
-  const registrantName = filing.registrant?.name || "—";
-  const filingType   = filing.filing_type_display || "—";
-  const filingDate   = filing.dt_posted ? filing.dt_posted.split("T")[0] : "—";
-  const amount       = filing.income
-    ? `$${Number(filing.income).toLocaleString()}`
-    : filing.expenses
-    ? `$${Number(filing.expenses).toLocaleString()}`
-    : "—";
-
-  // In-house = registrant name contains or matches the company's label keyword
-  const keyword = companyLabel.split(" ")[0].toLowerCase();
-  const isInHouse = registrantName.toLowerCase().includes(keyword) ||
-                    clientName.toLowerCase().includes(registrantName.toLowerCase().split(" ")[0]);
-  const firmType = isInHouse ? "IN-HOUSE" : "OUTSIDE FIRM";
-
-  // Get individual lobbyist names from the filing detail
-  const lobbyists = fetchLobbyistsForFiling(filing.filing_uuid);
-
-  if (lobbyists.length === 0) {
-    rows.push([companyLabel, clientName, registrantName, firmType, "No lobbyists listed", filingType, filingDate, amount]);
-  } else {
-    lobbyists.forEach(l => {
-      const name = [
-        l.lobbyist?.prefix || "",
-        l.lobbyist?.first_name || "",
-        l.lobbyist?.last_name || ""
-      ].filter(Boolean).join(" ").trim() || "—";
-
-      rows.push([companyLabel, clientName, registrantName, firmType, name, filingType, filingDate, amount]);
-    });
-  }
-
-  return rows;
-}
-
-
-// ============================================================
-//  FETCH INDIVIDUAL LOBBYISTS FROM A FILING DETAIL
-// ============================================================
-function fetchLobbyistsForFiling(filingUuid) {
-  const url = `${BASE_URL}/filings/${filingUuid}/?format=json`;
+const allResults = [];
+const paramKey = role === "client" ? "client_name" : "registrant_name";
+let page = 1;
+let hasMore = true;
+while (hasMore) {
+  const url = `${BASE_URL}/filings/?${paramKey}=${encodeURIComponent(name)}&filing_year=${FILING_YEAR}&filing_period=${FILING_PERIOD}&page=${page}&page_size=25&format=json`;
   try {
     const response = UrlFetchApp.fetch(url, {
       headers: { "Authorization": "Token " + API_KEY },
       muteHttpExceptions: true
     });
-    if (response.getResponseCode() !== 200) return [];
-    const data = JSON.parse(response.getContentText());
-
-    // Lobbyists can be nested inside lobbying_activities or at the top level
-    if (data.lobbying_activities && data.lobbying_activities.length > 0) {
-      return data.lobbying_activities.flatMap(a => a.lobbyists || []);
+    const code = response.getResponseCode();
+    if (code === 401) {
+      throw new Error("Invalid API key — check your key at lda.gov");
     }
-    return data.lobbyists || [];
+    if (code !== 200) {
+      Logger.log(`HTTP ${code} for "${name}" (${role}), page ${page}`);
+      break;
+    }
+    const data = JSON.parse(response.getContentText());
+    if (data.results && data.results.length > 0) {
+      // Only excludes amendments/registrations here — genuine
+      // entity matching now happens in fetchGenuineFilings(),
+      // not via a blacklist keyword.
+      const filtered = data.results.filter(filing => {
+        const filingType = (filing.filing_type_display || "").toLowerCase();
+        return !filingType.includes("amendment") && !filingType.includes("registration");
+      });
+      allResults.push(...filtered);
+      Logger.log(`  Found ${filtered.length} filing(s) for "${name}" as ${role}`);
+    }
+    hasMore = !!data.next;
+    page++;
+    Utilities.sleep(150);
   } catch (e) {
-    Logger.log(`Error fetching lobbyists for ${filingUuid}: ${e}`);
-    return [];
+    Logger.log(`Error for "${name}" (${role}): ${e}`);
+    break;
   }
 }
-
-
+return allResults;
+}
+// ============================================================
+//  BUILD SHEET ROWS FROM A FILING
+// ============================================================
+function buildRows(company, filing) {
+const rows = [];
+const clientName = filing.client?.name || "—";
+const registrantName = filing.registrant?.name || "—";
+const filingType = filing.filing_type_display || "—";
+const filingDate = filing.dt_posted ? filing.dt_posted.split("T")[0] : "—";
+const amount = filing.income
+  ? `$${Number(filing.income).toLocaleString()}`
+  : filing.expenses
+  ? `$${Number(filing.expenses).toLocaleString()}`
+  : "—";
+// In-house = the registrant genuinely IS the company itself
+// (replaces the old fragile "first word of label" keyword check,
+// which would've broken badly for a label like "X CORP (TWITTER)").
+const isInHouse = matchesCompany(company, registrantName);
+const firmType = isInHouse ? "IN-HOUSE" : "OUTSIDE FIRM";
+const lobbyists = fetchLobbyistsForFiling(filing.filing_uuid);
+if (lobbyists.length === 0) {
+  rows.push([company.label, clientName, registrantName, firmType, "No lobbyists listed", filingType, filingDate, amount, new Date()]);
+} else {
+  lobbyists.forEach(l => {
+    const name = [
+      l.lobbyist?.prefix || "",
+      l.lobbyist?.first_name || "",
+      l.lobbyist?.last_name || ""
+    ].filter(Boolean).join(" ").trim() || "—";
+    rows.push([company.label, clientName, registrantName, firmType, name, filingType, filingDate, amount, new Date()]);
+  });
+}
+return rows;
+}
+// ============================================================
+//  FETCH INDIVIDUAL LOBBYISTS FROM A FILING DETAIL
+// ============================================================
+function fetchLobbyistsForFiling(filingUuid) {
+const url = `${BASE_URL}/filings/${filingUuid}/?format=json`;
+try {
+  const response = UrlFetchApp.fetch(url, {
+    headers: { "Authorization": "Token " + API_KEY },
+    muteHttpExceptions: true
+  });
+  if (response.getResponseCode() !== 200) return [];
+  const data = JSON.parse(response.getContentText());
+  if (data.lobbying_activities && data.lobbying_activities.length > 0) {
+    return data.lobbying_activities.flatMap(a => a.lobbyists || []);
+  }
+  return data.lobbyists || [];
+} catch (e) {
+  Logger.log(`Error fetching lobbyists for ${filingUuid}: ${e}`);
+  return [];
+}
+}
 // ============================================================
 //  SHEET SETUP WITH HEADERS + FORMATTING
+//  clearExisting=true wipes the sheet (full rebuild).
+//  clearExisting=false just ensures the sheet/headers exist
+//  (incremental refresh appends below existing rows).
 // ============================================================
-function setupSheet() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName("LDA Q2 2025");
-  if (!sheet) {
-    sheet = ss.insertSheet("LDA Q2 2025");
-  } else {
-    sheet.clearContents();
-    sheet.clearFormats();
-  }
-
-  const headers = [
-    "Target Company",
-    "Client (as filed)",
-    "Registrant / Firm",
-    "In-House or Outside Firm",
-    "Lobbyist Name",
-    "Filing Type",
-    "Filing Date",
-    "Reported Amount"
-  ];
-
+function setupSheet(clearExisting) {
+const ss = SpreadsheetApp.getActiveSpreadsheet();
+let sheet = ss.getSheetByName(SHEET_NAME);
+const headers = [
+  "Target Company",
+  "Client (as filed)",
+  "Registrant / Firm",
+  "In-House or Outside Firm",
+  "Lobbyist Name",
+  "Filing Type",
+  "Filing Date",
+  "Reported Amount",
+  "Added On"
+];
+if (!sheet) {
+  sheet = ss.insertSheet(SHEET_NAME);
+} else if (clearExisting) {
+  sheet.clearContents();
+  sheet.clearFormats();
+}
+if (sheet.getLastRow() === 0) {
   const headerRange = sheet.getRange(1, 1, 1, headers.length);
   headerRange.setValues([headers]);
   headerRange.setBackground("#1a1a2e");
@@ -296,16 +381,44 @@ function setupSheet() {
   headerRange.setFontSize(11);
   headerRange.setFontFamily("Arial");
   sheet.setFrozenRows(1);
-
-  return sheet;
 }
-
-
+return sheet;
+}
 // ============================================================
-//  OPTIONAL: Daily auto-refresh trigger
+//  TRIGGER MANAGEMENT — 5 MIN AUTO-REFRESH
 // ============================================================
-function createDailyTrigger() {
-  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger("runAll").timeBased().everyDays(1).atHour(8).create();
-  SpreadsheetApp.getUi().alert("✅ Daily refresh set for 8am.");
+function enableAutoRefresh() {
+ScriptApp.getProjectTriggers().forEach(t => {
+  if (t.getHandlerFunction() === "refreshNewFilings") ScriptApp.deleteTrigger(t);
+});
+ScriptApp.newTrigger("refreshNewFilings").timeBased().everyMinutes(5).create();
+SpreadsheetApp.getUi().alert(
+  "✅ Auto-refresh enabled — checking for new filings every 5 minutes.\n\n" +
+  "Note: this hits the LDA API repeatedly across 15 companies and their name " +
+  "variations every 5 minutes. If you start seeing HTTP errors in the logs, " +
+  "you may be getting rate-limited — widen the interval if so."
+);
+}
+function disableAutoRefresh() {
+let removed = 0;
+ScriptApp.getProjectTriggers().forEach(t => {
+  if (t.getHandlerFunction() === "refreshNewFilings") {
+    ScriptApp.deleteTrigger(t);
+    removed++;
+  }
+});
+SpreadsheetApp.getUi().alert(removed > 0 ? "✅ Auto-refresh disabled." : "No auto-refresh trigger was running.");
+}
+// ============================================================
+//  MENU
+// ============================================================
+function onOpen() {
+SpreadsheetApp.getUi()
+  .createMenu("LDA Tools")
+  .addItem("Full Rebuild (wipes + refetches everything)", "runAll")
+  .addItem("Check For New Filings Now", "refreshNewFilings")
+  .addSeparator()
+  .addItem("Enable Auto-Refresh (every 5 min)", "enableAutoRefresh")
+  .addItem("Disable Auto-Refresh", "disableAutoRefresh")
+  .addToUi();
 }
